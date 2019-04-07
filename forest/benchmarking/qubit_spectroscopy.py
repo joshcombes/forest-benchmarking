@@ -13,7 +13,6 @@ from pyquil.paulis import PauliTerm
 from pyquil.operator_estimation import ExperimentSetting, zeros_state
 
 from forest.benchmarking.utils import transform_pauli_moments_to_bit
-from forest.benchmarking.randomized_benchmarking import populate_rb_survival_statistics
 from forest.benchmarking.stratified_experiment import StratifiedExperiment, Layer, \
     acquire_stratified_data
 
@@ -43,7 +42,7 @@ def generate_t1_experiment(qubit: int, times: Sequence[float]) -> StratifiedExpe
     :return: A dataframe with columns: time, t1 program
     """
     layers = []
-    for t in sorted(times):
+    for t in times:
         t = round(t, 7)  # enforce 100ns boundaries
         sequence = ([Program(RX(np.pi, qubit)), Program(Pragma('DELAY', [qubit], str(t)))])
         settings = (ExperimentSetting(zeros_state([qubit]), PauliTerm('Z', qubit)), )
@@ -51,7 +50,7 @@ def generate_t1_experiment(qubit: int, times: Sequence[float]) -> StratifiedExpe
 
         # the depth is time in units of [100ns]
         layers.append(Layer(int(round(t_in_us / USEC_PER_DEPTH)), sequence, settings, (qubit,),
-                            "T"+str(t_in_us)+"us", continuous_param = t_in_us))
+                            "T"+str(t_in_us)+"us", continuous_param = t))
 
     return StratifiedExperiment(tuple(layers), (qubit,), "T1")
 
@@ -116,9 +115,9 @@ def plot_t1_estimate_over_data(experiments: Union[StratifiedExperiment,
         q = expt.qubits[0]
 
         times = [layer.depth * USEC_PER_DEPTH for layer in expt.layers]  # times in u-seconds
-        zero_survival = [layer.estimates["Fraction One"][0] for layer in expt.layers]
+        one_survival = [layer.estimates["Fraction One"][0] for layer in expt.layers]
 
-        plt.plot(times, zero_survival, 'o-', label=f"QC{q} T1 data")
+        plt.plot(times, one_survival, 'o-', label=f"QC{q} T1 data")
         plt.plot(times, exponential_decay_curve(np.array(times), *fit_params),
                  label=f"QC{q} fit: T1={fit_params[1]:.2f}us")
 
@@ -154,15 +153,14 @@ def generate_t2_star_experiment(qubit: int, times: Sequence[float], detuning: fl
         sequence = ([Program(RX(np.pi / 2, qubit)),  # prep
                      Program(Pragma('DELAY', [qubit], str(t))) # delay and measure
                      + RZ(2 * np.pi * t * detuning, qubit) + RX(np.pi / 2, qubit)])
-        settings = tuple(ExperimentSetting(zeros_state([qubit]), op)
-                         for op in all_pauli_z_terms([qubit]))
-        t_in_us = round(t/MICROSECOND,1)
-        components = (Component(sequence, settings, [qubit], "T"+str(t_in_us)+"us"), )
+        settings = (ExperimentSetting(zeros_state([qubit]), PauliTerm('Z', qubit)),)
+        t_in_us = round(t / MICROSECOND, 1)
 
         # the depth is time in units of [100ns]
-        layers.append(Layer(int(round(t_in_us / USEC_PER_DEPTH)), components))
+        layers.append(Layer(int(round(t_in_us / USEC_PER_DEPTH)), sequence, settings, (qubit,),
+                            "T" + str(t_in_us) + "us", continuous_param=t))
 
-    return StratifiedExperiment(tuple(layers), [qubit], "T2star", meta_data={'Detuning': detuning})
+    return StratifiedExperiment(tuple(layers), (qubit,), "T2star", meta_data={'Detuning': detuning})
 
 
 def generate_t2_echo_experiment(qubit: int, times: Sequence[float], detuning: float = 5e6) \
@@ -187,15 +185,14 @@ def generate_t2_echo_experiment(qubit: int, times: Sequence[float], detuning: fl
                      # delay/echo/delay and measure
                      echo_prog + RZ(2 * np.pi * t * detuning, qubit) + RX(np.pi / 2, qubit)])
 
-        settings = tuple(ExperimentSetting(zeros_state([qubit]), op)
-                         for op in all_pauli_z_terms([qubit]))
-        t_in_us = round(t/MICROSECOND,1)
-        components = (Component(sequence, settings, [qubit], "T"+str(t_in_us)+"us"), )
+        settings = (ExperimentSetting(zeros_state([qubit]), PauliTerm('Z', qubit)),)
+        t_in_us = round(t / MICROSECOND, 1)
 
         # the depth is time in units of [100ns]
-        layers.append(Layer(int(round(t_in_us / USEC_PER_DEPTH)), components))
+        layers.append(Layer(int(round(t_in_us / USEC_PER_DEPTH)), sequence, settings, (qubit,),
+                            "T" + str(t_in_us) + "us", continuous_param=t_in_us))
 
-    return StratifiedExperiment(tuple(layers), [qubit], "T2echo", meta_data={'Detuning': detuning})
+    return StratifiedExperiment(tuple(layers), (qubit,), "T2echo", meta_data={'Detuning': detuning})
 
 
 def acquire_t2_data(qc: QuantumComputer, experiments: Sequence[StratifiedExperiment], num_shots):
@@ -211,13 +208,12 @@ def acquire_t2_data(qc: QuantumComputer, experiments: Sequence[StratifiedExperim
         experiments = [experiments]
     acquire_stratified_data(qc, experiments, num_shots)
     for expt in experiments:
-        # TODO: standardize survival to mean 0s survival? Change label?
-        populate_rb_survival_statistics(expt) # populate with relevant estimates
         for layer in expt.layers:
-            prob0, err = layer.components[0].estimates["Survival"]
-            # TODO: standardize estimate organization, labels
+            z_expectation = layer.results[0].expectation
+            var = layer.results[0].stddev**2
+            prob0, bit_var = transform_pauli_moments_to_bit(z_expectation, var)
             # TODO: allow addition to estimates or always over-write?
-            layer.estimates = {"Fraction One": (1- prob0, err)}
+            layer.estimates = {"Fraction One": (1- prob0, np.sqrt(bit_var))}
 
 
 def estimate_t2(experiment: StratifiedExperiment):
@@ -262,9 +258,9 @@ def plot_t2_estimate_over_data(experiments: Union[StratifiedExperiment,
         q = expt.qubits[0]
 
         times = [layer.depth * USEC_PER_DEPTH for layer in expt.layers]  # times in u-seconds
-        zero_survival = [layer.estimates["Fraction One"][0] for layer in expt.layers]
+        one_survival = [layer.estimates["Fraction One"][0] for layer in expt.layers]
 
-        plt.plot(times, zero_survival, 'o-', label=f"QC{q} T1 data")
+        plt.plot(times, one_survival, 'o-', label=f"QC{q} T2 data")
         plt.plot(times, exponentially_decaying_sinusoidal_curve(np.array(times), *fit_params),
                  label=f"QC{q} fit: freq={fit_params[2] / MHZ:.2f}MHz, "
                        f""f"T2={fit_params[1] / MICROSECOND:.2f}us")
