@@ -156,6 +156,12 @@ def _get_simultaneous_groups(layers: Sequence[Layer]):
             if len(qbs1.intersection( set(layers[node2].qubits))) == 0:
                 # no shared qubits so add edge
                 g.add_edge(node1, node2)
+            elif layers[node1].sequence == layers[node2].sequence:
+                # programs are the same, so experiment settings may be parallelizable
+                # TODO: check behavior... multiple copies of the same experiment may be
+                #  effectively erased, but without this one cannot run e.g. a cz ramsey or rpe
+                #  experiment while measuring multiple qubits simultaneously.
+                g.add_edge(node1, node2)
 
     # get the largest groups of nodes with shared edges, as each can be run simultaneously
     _, cliques = clique_removal(g)
