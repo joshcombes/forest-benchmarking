@@ -112,7 +112,7 @@ def generate_rb_experiment(qubits: Sequence[int], depths: Sequence[int], num_seq
     if interleaved_gate is not None:
         expt_type = "I" + expt_type  #interleaved rb.
 
-    return StratifiedExperiment(tuple(layers), tuple(qubits), tuple(depths), expt_type)
+    return StratifiedExperiment(tuple(layers), tuple(qubits), expt_type)
 
 
 def generate_unitarity_experiment(qubits: Sequence[int], depths: Sequence[int], num_sequences: int,
@@ -145,7 +145,7 @@ def generate_unitarity_experiment(qubits: Sequence[int], depths: Sequence[int], 
 
     expt_type = "URB"
 
-    return StratifiedExperiment(tuple(layers), tuple(qubits), tuple(depths), expt_type)
+    return StratifiedExperiment(tuple(layers), tuple(qubits), expt_type)
 
 
 def populate_rb_survival_statistics(expt: StratifiedExperiment):
