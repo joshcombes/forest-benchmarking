@@ -9,11 +9,12 @@ from pyquil.api import QuantumComputer
 from pyquil.gates import RX, RZ, CZ, MEASURE
 from pyquil.quil import Program
 from pyquil.quilbase import Pragma
+from pyquil.paulis import PauliTerm
 from pyquil.operator_estimation import ExperimentSetting, zeros_state
 
-from forest.benchmarking.utils import all_pauli_z_terms
+from forest.benchmarking.utils import transform_pauli_moments_to_bit
 from forest.benchmarking.randomized_benchmarking import populate_rb_survival_statistics
-from forest.benchmarking.stratified_experiment import StratifiedExperiment, Layer, Component, \
+from forest.benchmarking.stratified_experiment import StratifiedExperiment, Layer, \
     acquire_stratified_data
 
 MILLISECOND = 1e-6  # A millisecond (ms) is an SI unit of time
@@ -45,15 +46,14 @@ def generate_t1_experiment(qubit: int, times: Sequence[float]) -> StratifiedExpe
     for t in sorted(times):
         t = round(t, 7)  # enforce 100ns boundaries
         sequence = ([Program(RX(np.pi, qubit)), Program(Pragma('DELAY', [qubit], str(t)))])
-        settings = tuple(ExperimentSetting(zeros_state([qubit]), op) for op in all_pauli_z_terms([
-            qubit]))
-        t_in_us = t/MICROSECOND
-        components = (Component(sequence, settings, [qubit], "T"+str(t_in_us)+"us"), )
+        settings = (ExperimentSetting(zeros_state([qubit]), PauliTerm('Z', qubit)), )
+        t_in_us = round(t/MICROSECOND, 1)
 
         # the depth is time in units of [100ns]
-        layers.append(Layer(int(round(t_in_us / USEC_PER_DEPTH)), components))
+        layers.append(Layer(int(round(t_in_us / USEC_PER_DEPTH)), sequence, settings, (qubit,),
+                            "T"+str(t_in_us)+"us", continuous_param = t_in_us))
 
-    return StratifiedExperiment(tuple(layers), [qubit], "T1")
+    return StratifiedExperiment(tuple(layers), (qubit,), "T1")
 
 
 def acquire_t1_data(qc: QuantumComputer, experiments: Sequence[StratifiedExperiment], num_shots):
@@ -69,13 +69,12 @@ def acquire_t1_data(qc: QuantumComputer, experiments: Sequence[StratifiedExperim
         experiments = [experiments]
     acquire_stratified_data(qc, experiments, num_shots)
     for expt in experiments:
-        # TODO: standardize survival to mean 0s survival? Change label?
-        populate_rb_survival_statistics(expt) # populate with relevant estimates
         for layer in expt.layers:
-            prob0, err = layer.components[0].estimates["Survival"]
-            # TODO: standardize estimate organization, labels
+            z_expectation = layer.results[0].expectation
+            var = layer.results[0].stddev**2
+            prob0, bit_var = transform_pauli_moments_to_bit(z_expectation, var)
             # TODO: allow addition to estimates or always over-write?
-            layer.estimates = {"Fraction One": (1- prob0, err)}
+            layer.estimates = {"Fraction One": (1- prob0, np.sqrt(bit_var))}
 
 
 def estimate_t1(experiment: StratifiedExperiment):

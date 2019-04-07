@@ -1,242 +1,389 @@
+from collections import OrderedDict
 from math import pi
-from typing import Iterable, List, Tuple, Sequence
+from typing import Iterable, List, Tuple
+from itertools import chain
 
 import numpy as np
 from lmfit import Model
+from numpy import bincount
 from numpy import pi
+from pandas import DataFrame, Series
+from pyquil.operator_estimation import measure_observables
 from scipy.stats import beta
 
-from pyquil.api import BenchmarkConnection, QuantumComputer, get_benchmarker
+from pyquil.api import BenchmarkConnection, QuantumComputer
 from pyquil.gates import CZ, RX, RZ
 from pyquil.quilbase import Gate
+from pyquil.quil import address_qubits, merge_programs
 from pyquil import Program
-from pyquil.operator_estimation import ExperimentSetting, zeros_state
+from pyquil.quilatom import QubitPlaceholder
+from forest.benchmarking.tomography import generate_state_tomography_experiment, acquire_tomography_data
 
-from forest.benchmarking.tomography import _state_tomo_settings
-from forest.benchmarking.utils import all_pauli_z_terms
-from forest.benchmarking.compilation import basic_compile
-from forest.benchmarking.stratified_experiment import StratifiedExperiment, Layer, Component, \
-acquire_stratified_data
+RB_TYPES = ["std-1q", "std-2q", "sim-1q", "sim-2q"]
 
 
-bm = get_benchmarker()
+def rb_dataframe(rb_type: str, subgraph: List[Tuple], depths: List[int],
+                 num_sequences: int) -> DataFrame:
+    """
+    Generate and return a DataFrame to characterize an RB or unitarity measurement.
+
+    For standard RB see
+    [RB] Scalable and Robust Randomized Benchmarking of Quantum Processes
+         Magesan et al.,
+         Phys. Rev. Lett. 106, 180504 (2011)
+         https://dx.doi.org/10.1103/PhysRevLett.106.180504
+         https://arxiv.org/abs/1009.3639
+
+    Unitarity algorithm is due to
+    [ECN]  Estimating the Coherence of Noise
+           Wallman et al.,
+           New Journal of Physics 17, 113020 (2015)
+           https://dx.doi.org/10.1088/1367-2630/17/11/113020
+           https://arxiv.org/abs/1503.07865
+
+    :param rb_type: Label saying which type of RB measurement we're running
+    :param subgraph: List of tuples, where each tuple specifies a single qubit or pair of qubits on
+         which to run RB. If the length of this list is >1 then we are running simultaneous RB.
+    :param depths: List of RB sequence depths (numbers of Cliffords) to include in this measurement
+    :param num_sequences: Number of different random sequences to run at each depth
+    :return: DataFrame with one row for every sequence in the measurement
+    """
+    if not rb_type in RB_TYPES:
+        raise ValueError(f"Invalid RB type {rb_type} specified. Valid choices are {RB_TYPES}.")
+    if len(subgraph) > 1 and not "sim" in rb_type:
+        raise ValueError("Found multiple entries in subgraph but rb_type does not specify a "
+                         "simultaneous experiment.")
+
+    def df_dict():
+        for d in depths:
+            for _ in range(num_sequences):
+                yield OrderedDict({"RB Type": rb_type,
+                                   "Subgraph": subgraph,
+                                   "Depth": d})
+
+    # TODO: Put dtypes on this DataFrame in the right way
+    return DataFrame(df_dict())
 
 
-def oneq_rb_gateset(qubit: int) -> Gate:
+def add_sequences_to_dataframe(df: DataFrame, bm: BenchmarkConnection, random_seed: int = None, interleaved_gate: Program = None):
+    """
+    Generates a new random sequence for each row in the measurement DataFrame and adds these to a
+    copy of the DataFrame. Returns the new DataFrame.
+
+    :param df: An rb dataframe populated with subgraph and depth columns whose copy will be populated with sequences.
+    :param bm: A benchmark connection that will do the grunt work of generating the sequences
+    :param random_seed: Base random seed used to seed compiler for sequence generation for each subgraph element
+    :param interleaved_gate: Gate to interleave in between Cliffords; used for interleaved RB experiment
+    :return: New DataFrame with the desired rb sequences stored in "Sequence" column
+    """
+    new_df = df.copy()
+    if random_seed is None:
+        new_df["Sequence"] = Series([generate_simultaneous_rb_sequence(bm, s, d, interleaved_gate=interleaved_gate) for (s, d)
+                                     in zip(new_df["Subgraph"].values, new_df["Depth"].values)])
+    else:
+        # use random_seed as the seed for the first call, and increment for subsequent calls
+        new_df["Sequence"] = Series(
+            [generate_simultaneous_rb_sequence(bm, s, d, random_seed + j * len(s), interleaved_gate)
+             for j, (s, d) in enumerate(zip(new_df["Subgraph"].values, new_df["Depth"].values))])
+    return new_df
+
+
+def rb_seq_to_program(rb_seq: List[Program], subgraph: List[Tuple]) -> Program:
+    """
+    Combines an RB sequence into a single program that includes appends measurements and returns
+    this Program.
+
+    :rtype: Program
+    """
+    qubits = list(chain.from_iterable(subgraph))
+    program = merge_programs(rb_seq)
+    ro = program.declare('ro', 'BIT', len(qubits))
+    return program.measure_all(*zip(qubits,ro))
+
+
+def run_rb_measurement(df: DataFrame, qc: QuantumComputer, num_trials: int):
+    """
+    Executes trials on all sequences and adds the results to a copy of the DataFrame. Returns
+    the new DataFrame.
+    """
+    new_df = df.copy()
+
+    def run(qc: QuantumComputer, seq: List[Program], sg: List[Tuple], num_trials: int) -> np.ndarray:
+        prog = rb_seq_to_program(seq, sg).wrap_in_numshots_loop(num_trials)
+        executable = qc.compiler.native_quil_to_executable(prog)
+        return qc.run(executable)
+    seqs = new_df["Sequence"].values
+    sgs = new_df["Subgraph"].values
+    new_df["Results"] = Series([run(qc, seq, sg, num_trials) for seq, sg in zip(seqs, sgs)])
+    return new_df
+
+
+def oneq_rb_gateset(qubit: QubitPlaceholder) -> Gate:
     """
     Yield the gateset for 1-qubit randomized benchmarking.
 
-    :param qubit: The qubit to effect the gates on.
+    :param qubit: The qubit to effect the gates on. Might I suggest you provide
+        a :py:class:`QubitPlaceholder`?
     """
     for angle in [-pi, -pi / 2, pi / 2, pi]:
         for gate in [RX, RZ]:
             yield gate(angle, qubit)
 
 
-def twoq_rb_gateset(q1: int, q2: int) -> Iterable[Gate]:
+def twoq_rb_gateset(q1: QubitPlaceholder, q2: QubitPlaceholder) -> Iterable[Gate]:
     """
     Yield the gateset for 2-qubit randomized benchmarking.
 
     This is two 1-q gatesets and ``CZ``.
 
-    :param q1: The first qubit.
-    :param q2: The second qubit.
+    :param q1: The first qubit. Might I suggest you provide a :py:class:`QubitPlaceholder`?
+    :param q2: The second qubit. Might I suggest you provide a :py:class:`QubitPlaceholder`?
     """
     yield from oneq_rb_gateset(q1)
     yield from oneq_rb_gateset(q2)
     yield CZ(q1, q2)
 
 
-def get_rb_gateset(qubits: Sequence[int]) -> List[Gate]:
+def get_rb_gateset(rb_type: str) -> Tuple[List[Gate], Tuple[QubitPlaceholder]]:
     """
     A wrapper around the gateset generation functions.
 
     :param rb_type: "1q" or "2q".
     :returns: list of gates, tuple of qubits
     """
-    if len(qubits) == 1:
-        return list(oneq_rb_gateset(qubits[0]))
+    if rb_type == '1q':
+        q = QubitPlaceholder()
+        return list(oneq_rb_gateset(q)), (q,)
 
-    if len(qubits) == 2:
-        return list(twoq_rb_gateset(*qubits))
+    if rb_type == '2q':
+        q1, q2 = QubitPlaceholder.register(n=2)
+        return list(twoq_rb_gateset(q1, q2)), (q1, q2)
 
-    raise ValueError(f"No RB gateset for more than two qubits.")
+    raise ValueError(f"No RB gateset for {rb_type}")
 
 
-def generate_rb_sequence(qubits: Sequence[int], depth: int,  interleaved_gate: Program = None,
-                         random_seed: int = None) -> List[Program]:
+def generate_rb_sequence(compiler: BenchmarkConnection, rb_type: str,
+                         depth: int,  random_seed: int = None) -> (List[Program], List[QubitPlaceholder]):
     """
     Generate a complete randomized benchmarking sequence.
 
-    :param qubits:
+    :param compiler: A compiler connection that will do the grunt work of generating the sequences
+    :param rb_type: "1q" or "2q".
     :param depth: The total number of Cliffords in the sequence (including inverse)
     :param random_seed: Random seed passed to compiler to seed sequence generation.
-    :param interleaved_gate:
-    :return:
+    :return: A dictionary with keys "program", "qubits", and "bits".
     """
     if depth < 2:
-        raise ValueError("Sequence depth must be at least 2 for rb sequences, or at least 1 for "
-                         "unitarity sequences.")
-    gateset = get_rb_gateset(qubits)
-    programs = bm.generate_rb_sequence(depth=depth, gateset=gateset, interleaver=interleaved_gate,
-                                       seed=random_seed)
-    return programs
+        raise ValueError("Sequence depth must be at least 2 for rb sequences, or at least 1 for unitarity sequences.")
+    gateset, q_placeholders = get_rb_gateset(rb_type=rb_type)
+    programs = compiler.generate_rb_sequence(depth=depth, gateset=gateset, seed=random_seed)
+    return programs, q_placeholders
 
 
-def generate_rb_experiment(qubits: Sequence[int], depths: List[int], num_sequences: int,
-                           interleaved_gate: Program = None, random_seed: int = None) \
-        -> StratifiedExperiment:
+def generate_simultaneous_rb_sequence(bm: BenchmarkConnection, subgraph: list,
+                                      depth: int,  random_seed: int = None, interleaved_gate: Program = None) -> list:
     """
+    Generates a Simultaneous RB Sequence -- a list of Programs where each Program performs a
+    simultaneous Clifford on the given subgraph (single qubit or pair of qubits), and where the
+    execution of all the Programs composes to the Identity on all edges.
 
-    :param qubits: the qubits for a single isolated rb experiment
-    :param depths:
-    :param num_sequences:
-    :param interleaved_gate:
-    :param random_seed:
-    :return:
+    :param bm: A benchmark connection that will do the grunt work of generating the sequences
+    :param subgraph: Iterable of tuples of integers specifying qubit singletons or pairs
+    :param depth: The total number of Cliffords to perform on all edges (including inverse)
+    :param random_seed: Base random seed used to seed compiler for sequence generation for each subgraph element
+    :param interleaved_gate: Gate to interleave in between Cliffords; used for interleaved RB experiment
+    :return: RB Sequence as a list of Programs
     """
-    layers = []  # we will have len(depths) many layers, one layer per depth.
-    for depth in depths:
-        components = []  # each layer will have num_sequences many components.
-        for idx in range(num_sequences):
-            if random_seed is not None:  # need to change the base seed for each sequence generated
-                random_seed += 1
+    if depth < 2:
+        raise ValueError("Sequence depth must be at least 2 for rb sequences, or at least 1 for unitarity sequences.")
+    size = len(subgraph[0])
+    assert all([len(x) == size for x in subgraph])
+    if size == 1:
+        q_placeholders = QubitPlaceholder().register(n=1)
+        gateset = list(oneq_rb_gateset(*q_placeholders))
+    elif size == 2:
+        q_placeholders = QubitPlaceholder.register(n=2)
+        gateset = list(twoq_rb_gateset(*q_placeholders))
+    else:
+        raise ValueError("Subgraph elements must have length 1 or 2.")
+    sequences = []
+    for j, qubits in enumerate(subgraph):
+        if random_seed is not None:
+            sequence = bm.generate_rb_sequence(depth=depth, gateset=gateset, seed=random_seed+j,
+                                                     interleaver=interleaved_gate)
+        else:
+            sequence = bm.generate_rb_sequence(depth=depth, gateset=gateset, interleaver=interleaved_gate)
+        qubit_map = {qp: qid for (qp, qid) in zip(q_placeholders, qubits)}
+        sequences.append([address_qubits(prog, qubit_map) for prog in sequence])
+    return merge_sequences(sequences)
 
-            # a sequence is just a list of Cliffords, with last Clifford inverting the sequence
-            sequence = generate_rb_sequence(qubits, depth, interleaved_gate, random_seed)
-            settings = [ExperimentSetting(zeros_state(qubits), op)
-                        for op in all_pauli_z_terms(qubits)]
-            components.append(Component(tuple(sequence), tuple(settings), tuple(qubits),
-                                        f'Seq{idx}'))
-        layers.append(Layer(depth, tuple(components)))
 
-    exp_type = "RB"
-    if interleaved_gate is not None:
-        exp_type = "I" + exp_type  #interleaved rb.
-
-    return StratifiedExperiment(tuple(layers), tuple(qubits), exp_type)
-
-
-def generate_unitarity_experiment(qubits: Sequence[int], depths: List[int], num_sequences: int,
-                                  use_self_inv_seqs = False, random_seed: int = None) \
-        -> StratifiedExperiment:
+def merge_sequences(sequences: list) -> list:
     """
-    Essentially the same as generate_rb_experiment, just stripping off last gate, no option for
-    interleaving.
+    Takes a list of equal-length "sequences" (lists of Programs) and merges them element-wise,
+    returning the merged outcome.
 
-    :param qubits: qubits for a single isolated unitary rb experiment
-    :param depths:
-    :param num_sequences:
-    :param use_self_inv_seqs:
-    :param random_seed:
-    :return:
+    :param sequences: List of equal-length Lists of Programs
+    :return: A single List of Programs
     """
-    layers = []
-    for depth in depths:
-        components = []
-        for idx in range(num_sequences):
-            if random_seed is not None:
-                random_seed += 1
-
-            if use_self_inv_seqs:
-                sequence = generate_rb_sequence(qubits, depth, random_seed)
-            else:  # provide larger depth and strip inverse from end of each sequence
-                sequence = generate_rb_sequence(qubits, depth + 1, random_seed)[:-1]
-            settings = _state_tomo_settings(qubits)
-            components.append(Component(tuple(sequence), tuple(settings), tuple(qubits),
-                                        f'Seq{idx}'))
-        layers.append(Layer(depth, tuple(components)))
-
-    exp_type = "URB"
-
-    return StratifiedExperiment(tuple(layers), tuple(qubits), exp_type)
+    depth = len(sequences[0])
+    assert all([len(s) == depth for s in sequences])
+    return [merge_programs([seq[idx] for seq in sequences]) for idx in range(depth)]
 
 
-def populate_rb_survival_statistics(expt: StratifiedExperiment):
+########
+# Unitarity
+########
+
+
+def strip_inverse_from_sequences(df: DataFrame):
     """
-    Calculate the mean and variance of the estimated probability of the zeros state given the
-    expectation of all operators with Z terms.
+    Removes the inverse (the last gate) from each of the RB sequences in a copy of the
+    DataFrame and returns the copy.
 
-    We first convert the operator expectation values into a density matrix, then take the (0, 0)
-    component of this matrix as the probability of the all zeros state. For binary classified data
-    with N counts of 1 and M counts of 0, these can be estimated using the mean and variance of
-    the beta distribution beta(N+1, M+1) where the +1 is used to incorporate an unbiased Bayes
-    prior.
-
-    :param expt: A StratifiedExperiment whose Components have been populated with results.
-    :return:
+    :param df: Dataframe with "Sequence" series.
+    :return new_df: A copy of the input df with each entry in the "Sequence" series
+               lacking the last inverse gate
     """
-    for layer in expt.layers:
-        for component in layer.components:
-            # exclude operators that include x or y; no change for a standard rb experiment
-            z_terms = [result for result in component.results
-                       if 'X' not in result.setting.out_operator.compact_str()
-                       and 'Y' not in result.setting.out_operator.compact_str()]
-
-            # This assumes inclusion of I term with expectation 1 to make dim many total terms
-            assert 2**len(component.qubits) == len(z_terms)
-            # get the fraction of all zero outcomes 00...00
-            fraction_survived = np.mean([result.expectation for result in z_terms])
-            num_survived = fraction_survived * component.num_shots
-            num_died =  component.num_shots - num_survived  # the number of non-zero results
-
-            # mean and variance given by beta distribution with a uniform prior
-            survival_mean = beta.mean(num_survived + 1, num_died + 1)
-            survival_var = beta.var(num_survived + 1, num_died + 1)
-
-            survival_stats = {"Survival": (survival_mean, np.sqrt(survival_var))}
-            component.estimates = survival_stats
+    new_df = df.copy()
+    new_df["Sequence"] = Series([seq[:-1] for seq in new_df["Sequence"].values])
+    return new_df
 
 
-def populate_unitarity_purity_statistics(expt: StratifiedExperiment):
+def add_unitarity_sequences_to_dataframe(df: DataFrame, bm: BenchmarkConnection, random_seed: int = None):
     """
-    Calculate the mean and variance of the estimated probability of the zeros state given the
-    expectation of all operators with Z terms.
+    Generates a new random unitarity sequence for each row in the measurement DataFrame and adds
+    these to a copy of the DataFrame.
 
-    We first convert the operator expectation values into a density matrix, then take the (0, 0)
-    component of this matrix as the probability of the all zeros state. For binary classified data
-    with N counts of 1 and M counts of 0, these can be estimated using the mean and variance of
-    the beta distribution beta(N+1, M+1) where the +1 is used to incorporate an unbiased Bayes
-    prior.
-
-    :param expt: A StratifiedExperiment whose Components have been populated with results.
-    :return:
+    A unitarity sequence of depth D is a standard RB sequence
+    of depth D+1 with the last (inversion) gate stripped. Returns the new DataFrame.
     """
-    for layer in expt.layers:
-        for component in layer.components:
-            # This assumes inclusion of I term with expectation 1 to make dim**2 many total terms
-            dim = 2**len(component.qubits)
-            assert dim**2 == len(component.results), "Ensure identity term is included."
-
-            expectations = np.array([result.expectation for result in component.results])
-            variances = np.array([result.stddev**2 for result in component.results])
-
-            shifted_purity = estimate_purity(dim, expectations)
-            shifted_purity_error = estimate_purity_err(dim, expectations, variances)
-            shifted_purity_stats = {"Shifted Purity": (shifted_purity, shifted_purity_error)}
-            component.estimates = shifted_purity_stats
+    new_df = df.copy()
+    if random_seed is not None:
+        new_df["Sequence"] = Series([generate_simultaneous_rb_sequence(bm, s, d, random_seed + len(s) * j) for j, (s, d)
+                                     in enumerate(zip(new_df["Subgraph"].values, new_df["Depth"].values + 1))])
+                            #TODO: check consistency with depth for RB
+    else:
+        new_df["Sequence"] = Series([generate_simultaneous_rb_sequence(bm, s, d) for (s, d)
+                                     in zip(new_df["Subgraph"].values, new_df["Depth"].values + 1)])
+                            #TODO: check consistency with depth for RB
+    stripped_seq_df = strip_inverse_from_sequences(new_df)
+    return stripped_seq_df
 
 
-def acquire_rb_data(qc, experiments: Sequence[StratifiedExperiment], num_shots: int = 500):
-    if not isinstance(experiments, Sequence):
-        experiments = [experiments]
-    compile_method = qc.compiler.quil_to_native_quil
-    qc.compiler.quil_to_native_quil = basic_compile
-    acquire_stratified_data(qc, experiments, num_shots)
-    qc.compiler.quil_to_native_quil = compile_method  # restore the original compilation
-    for expt in experiments:
-        populate_rb_survival_statistics(expt) # populate with relevant estimates
+def run_unitarity_measurement(df: DataFrame, qc: QuantumComputer, num_trials: int):
+    """
+    Execute trials on all sequences and add the results to a copy of the DataFrame. Returns the
+    new DataFrame.
+    """
+    new_df = df.copy()
+    def run(qc: QuantumComputer, seq: List[Program], subgraph: List[List[int]], num_trials: int) -> np.ndarray:
+        prog = merge_programs(seq)
+        # TODO: parallelize
+        results = []
+        for qubits in subgraph:
+            state_prep = prog
+            tomo_exp = generate_state_tomography_experiment(state_prep, qubits=qubits)
+            _rs = list(measure_observables(qc, tomo_exp, num_trials))
+            # Inelegant shim from state tomo refactor. To clean up!
+            expectations=[r.expectation for r in _rs[1:]]
+            variances=[r.stddev ** 2 for r in _rs[1:]]
+            results.append((expectations, variances))
+        return results
+
+    new_df["Results"] = Series(
+        [run(qc, seq, sg, num_trials) for seq, sg in zip(new_df["Sequence"].values, new_df["Subgraph"].values)])
+    return new_df
 
 
-def acquire_unitarity_data(qc, experiments: Sequence[StratifiedExperiment], num_shots: int = 500):
-    if not isinstance(experiments, Sequence):
-        experiments = [experiments]
-    compile_method = qc.compiler.quil_to_native_quil
-    qc.compiler.quil_to_native_quil = basic_compile
-    acquire_stratified_data(qc, experiments, num_shots)
-    qc.compiler.quil_to_native_quil = compile_method  # restore the original compilation
-    for expt in experiments:
-        populate_unitarity_purity_statistics(expt) # populate with relevant estimates
+def unitarity_to_RB_decay(unitarity, dimension):
+    """
+    This allows comparison of measured unitarity and RB decays.
+
+    This function provides an upper bound on the
+    RB decay given the input unitarity, where the upperbound is saturated when no unitary errors are present,
+    e.g. in the case of depolarizing noise. For more, see Proposition 8. in [ECN]
+        unitarity >= (1-dr/(d-1))^2
+    where r is the average gate infidelity and d is the dimension
+
+    :param unitarity: The measured decay parameter in a unitarity measurement
+    :param dimension: The dimension of the Hilbert space, 2^num_qubits
+    :return: The upperbound on RB decay, saturated if no unitary errors are present Proposition 8 [ECN]
+    """
+    r = (np.sqrt(unitarity) - 1)*(1-dimension)/dimension
+    return average_gate_infidelity_to_RB_decay(r, dimension)
+
+
+#########
+# Analysis stuff
+#########
+
+
+def survival_statistics(bitstrings):
+    """
+    Calculate the mean and variance of the estimated probability of the ground state given shot
+    data on one or more bits.
+
+    For binary classified data with N counts of 1 and M counts of 0, these
+    can be estimated using the mean and variance of the beta distribution beta(N+1, M+1) where the
+    +1 is used to incorporate an unbiased Bayes prior.
+
+    :param ndarray bitstrings: A 2D numpy array of repetitions x bit-arrays.
+    :return: (survival mean, sqrt(survival variance))
+    """
+    survived = np.sum(bitstrings, axis=1) == 0
+
+    # count obmurrences of 000...0 and anything besides 000...0
+    n_died, n_survived = bincount(survived, minlength=2)
+
+    # mean and variance given by beta distribution with a uniform prior
+    survival_mean = beta.mean(n_survived + 1, n_died + 1)
+    survival_var = beta.var(n_survived + 1, n_died + 1)
+    return survival_mean, np.sqrt(survival_var)
+
+
+def survivals_from_results(subgraph: List[Tuple],
+                           results: np.ndarray) -> (List[float], List[float]):
+    """
+    Group shot data by subgraph element and turn the shot data into survival statistics.
+
+    :return: Survival means and errors, in lists whose indices correspond to subgraph elements.
+    """
+    l = len(subgraph[0])  # 1 for 1Q, 2 for 2Q
+    means, errs = [], []
+    for idx, s in enumerate(subgraph):
+        # Group shot data by (qubit, ) or (qubit, pair)
+        shot_data = np.asarray(results)[:, l * idx:l * (idx + 1)]
+        mean, err = survival_statistics(shot_data)
+        means.append(mean)
+        errs.append(err)
+    return means, errs
+
+
+def add_survivals(df: DataFrame):
+    """
+    Calculate survival statistics on the measurement and add these to a copy of the DataFrame.
+    Returns the new DataFrame.
+    """
+    new_df = df.copy()
+    new_df["Survival Means"], new_df["Survival Errors"] = zip(
+        *new_df.apply(lambda row: survivals_from_results(row["Subgraph"], row["Results"]), axis=1))
+    return new_df
+
+
+def survivals_by_qubits(df: DataFrame, qubits: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Given a DataFrame that is already populated with survival data matching each subgraph entry,
+    find and return all depths, survival means, and survival errors for a given set of qubits.
+    """
+    depths, means, errs = [], [], []
+    # TODO: Make this smarter/faster/more scalable than iterrow'ing
+    for _, row in df.iterrows():
+        qubits_idx = row["Subgraph"].index(qubits)
+        depths.append(row["Depth"])
+        means.append(row["Survival Means"][qubits_idx])
+        errs.append(row["Survival Errors"][qubits_idx])
+    return np.asarray(depths), np.asarray(means), np.asarray(errs)
 
 
 def standard_rb(x, baseline, amplitude, decay):
@@ -289,50 +436,32 @@ def fit_standard_rb(depths, survivals, weights=None):
     return rb_model.fit(survivals, x=depths, params=params, weights=weights)
 
 
-def fit_rb_results(experiment):
-    """
-    Wrapper for plotting the results of a StratifiedExperiment; simply extracts key parameters
-    and passes on to the standard fit.
-
-    :param experiment:
-    :return:
-    """
-    depths = [layer.depth for layer in experiment.layers for _ in layer.components]
-    survivals = [comp.estimates["Survival"][0] for layer in experiment.layers for comp in
-                 layer.components]
-    weights = [1/comp.estimates["Survival"][1] for layer in experiment.layers for comp in
-               layer.components]
-    return fit_standard_rb(depths, survivals, np.asarray(weights))
-
-
 ########
-# Unitarity
+# Unitarity Analysis
 ########
 
-
-def estimate_purity(dim: int, op_expect: np.ndarray, renorm: bool=True):
+def estimate_purity(D: int, op_expect: np.ndarray, renorm: bool=True):
     """
     The renormalized, or 'shifted', purity is given in equation (10) of [ECN]
     where d is the dimension of the Hilbert space, 2**num_qubits
 
-    :param dim: dimension of the hilbert space
+    :param D: dimension of the hilbert space
     :param op_expect: array of estimated expectations of each operator being measured
     :param renorm: flag that renormalizes result to be between 0 and 1
     :return: purity given the operator expectations
     """
-    # assumes op_expect includes expectation of I with value 1.
-    purity = (1 / dim) * np.sum(op_expect * op_expect)
+    purity = (1 / D) * (1 + np.sum(op_expect * op_expect))
     if renorm:
-        purity = (dim / (dim - 1.0)) * (purity - 1.0 / dim)
+        purity = (D / (D - 1.0)) * (purity - 1.0 / D)
     return purity
 
 
-def estimate_purity_err(dim: int, op_expect: np.ndarray, op_expect_var: np.ndarray, renorm=True):
+def estimate_purity_err(D: int, op_expect: np.ndarray, op_expect_var: np.ndarray, renorm=True):
     """
     Propagate the observed variance in operator expectation to an error estimate on the purity.
     This assumes that each operator expectation is independent.
 
-    :param dim: dimension of the Hilbert space
+    :param D: dimension of the Hilbert space
     :param op_expect: array of estimated expectations of each operator being measured
     :param op_expect_var: array of estimated variance for each operator expectation
     :param renorm: flag that provides error for the renormalized purity
@@ -344,13 +473,57 @@ def estimate_purity_err(dim: int, op_expect: np.ndarray, op_expect_var: np.ndarr
     need_second_order = np.isclose([0.]*len(var_of_square_op_expect), var_of_square_op_expect, atol=1e-6)
     var_of_square_op_expect[need_second_order] = op_expect_var[need_second_order]**2
 
-    purity_var = (1 / dim) ** 2 * (np.sum(var_of_square_op_expect))
+    purity_var = (1 / D) ** 2 * (np.sum(var_of_square_op_expect))
+
 
     if renorm:
-        purity_var = (dim / (dim - 1.0)) ** 2 * purity_var
+        purity_var = (D / (D - 1.0)) ** 2 * purity_var
 
     return np.sqrt(purity_var)
 
+
+def shifted_purities_from_results(subgraph: List[Tuple],
+                          results: np.ndarray) -> (List[float], List[float]):
+    """
+    Group results by subgraph element and calculate the purity statistics.
+
+    :return: Shifted purities and corresponding errors, in lists whose indices correspond to subgraph elements.
+    """
+    purities, errs = [], []
+    for component, component_results in zip(subgraph, results):
+        expectations, variances = component_results
+        dimension = 2 ** len(component)
+        shifted_purity = estimate_purity(dimension, np.asarray(expectations))
+        err = estimate_purity_err(dimension,  np.asarray(expectations),  np.asarray(variances))
+        purities.append(shifted_purity)
+        errs.append(err)
+    return purities, errs
+
+
+def add_shifted_purities(df: DataFrame):
+    """
+    Calculate purities given a DataFrame containing "Results" and add these to a copy of the
+    DataFrame. Returns the new DataFrame.
+    """
+    new_df = df.copy()
+    new_df["Shifted Purities"], new_df["Purity Errors"] = zip(
+        *new_df.apply(lambda row: shifted_purities_from_results(row["Subgraph"], row["Results"]), axis=1))
+    return new_df
+
+
+def shifted_purities_by_qubits(df: DataFrame, qubits: Tuple) -> (np.array, np.array, np.array):
+    """
+    Given a DataFrame that is already populated with purity data matching each subgraph entry,
+    find and return all depths, shifted purities, and purity errors for a given set of qubits.
+    """
+    depths, shifted_purities, errs = [], [], []
+    # TODO: Make this smarter/faster/more scalable than iterrow'ing
+    for _, row in df.iterrows():
+        qubits_idx = row["Subgraph"].index(qubits)
+        depths.append(row["Depth"])
+        shifted_purities.append(row["Shifted Purities"][qubits_idx])
+        errs.append(row["Purity Errors"][qubits_idx])
+    return np.asarray(depths), np.asarray(shifted_purities), np.asarray(errs)
 
 def unitarity_fn(x, baseline, amplitude, unitarity):
     """
@@ -394,32 +567,6 @@ def fit_unitarity(depths, shifted_purities, weights=None):
     return unitarity_model.fit(shifted_purities, x=depths, params=params, weights=weights)
 
 
-def fit_unitarity_results(experiment):
-    # almost identitical to fit_rb_results, could probably be combined by examining the expt.type
-    depths = [layer.depth for layer in experiment.layers for _ in layer.components]
-    shifted_purities = [comp.estimates["Shifted Purity"][0] for layer in experiment.layers for comp
-                        in layer.components]
-    weights = [1/comp.estimates["Shifted Purity"][1] for layer in experiment.layers for comp in
-               layer.components]
-    return fit_unitarity(depths, shifted_purities, np.asarray(weights))
-
-
-def unitarity_to_RB_decay(unitarity, dimension):
-    """
-    This allows comparison of measured unitarity and RB decays. This function provides an upper bound on the
-    RB decay given the input unitarity, where the upperbound is saturated when no unitary errors are present,
-    e.g. in the case of depolarizing noise. For more, see Proposition 8. in [ECN]
-        unitarity >= (1-dr/(d-1))^2
-    where r is the average gate infidelity and d is the dimension
-
-    :param unitarity: The measured decay parameter in a unitarity measurement
-    :param dimension: The dimension of the Hilbert space, 2^num_qubits
-    :return: The upperbound on RB decay, saturated if no unitary errors are present Proposition 8 [ECN]
-    """
-    r = (np.sqrt(unitarity) - 1)*(1-dimension)/dimension
-    return average_gate_infidelity_to_RB_decay(r, dimension)
-
-
 ########
 # Interleaved RB Analysis
 ########
@@ -453,14 +600,17 @@ def interleaved_gate_fidelity_bounds(irb_decay, rb_decay, dim, unitarity = None)
     Optionally, use unitarity measurement result to provide improved bounds on the interleaved gate's fidelity.
 
     Bounds due to
-        [IRB] Efficient measurement of quantum gate error by interleaved randomized benchmarking
-            Magesan et al., Physical Review Letters 109, 080505 (2012)
-            arXiv:1203.4550
+    [IRB] Efficient measurement of quantum gate error by interleaved randomized benchmarking
+          Magesan et al.,
+          Phys. Rev. Lett. 109, 080505 (2012)
+          https://dx.doi.org/10.1103/PhysRevLett.109.080505
+          https://arxiv.org/abs/1203.4550
 
-    Improved bounds using unitarity due to:
-        [U+IRB]  Efficiently characterizing the total error in quantum circuits
-            Dugas, Wallman, and Emerson (2016)
-            arXiv:1610.05296v2
+    Improved bounds using unitarity due to
+    [U+IRB]  Efficiently characterizing the total error in quantum circuits
+             Dugas et al.,
+             arXiv:1610.05296 (2016)
+             https://arxiv.org/abs/1610.05296
 
     :param irb_decay: Observed decay parameter in irb experiment with desired gate interleaved between Cliffords
     :param rb_decay: Observed decay parameter in standard rb experiment
