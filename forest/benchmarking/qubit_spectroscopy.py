@@ -1,6 +1,7 @@
 from typing import Union, List, Tuple, Sequence
 
 import numpy as np
+from numpy import pi
 from scipy import optimize
 from matplotlib import pyplot as plt
 
@@ -43,7 +44,7 @@ def generate_t1_experiment(qubit: int, times: Sequence[float]) -> StratifiedExpe
     layers = []
     for t in times:
         t = round(t, 7)  # enforce 100ns boundaries
-        sequence = ([Program(RX(np.pi, qubit)), Program(Pragma('DELAY', [qubit], str(t)))])
+        sequence = ([Program(RX(pi, qubit)), Program(Pragma('DELAY', [qubit], str(t)))])
         settings = (ExperimentSetting(zeros_state([qubit]), PauliTerm('Z', qubit)), )
         t_in_us = round(t/MICROSECOND, 1)
 
@@ -116,9 +117,9 @@ def plot_t1_estimate_over_data(experiments: Union[StratifiedExperiment,
         times = [layer.depth * USEC_PER_DEPTH for layer in expt.layers]  # times in u-seconds
         one_survival = [layer.estimates["Fraction One"][0] for layer in expt.layers]
 
-        plt.plot(times, one_survival, 'o-', label=f"QC{q} T1 data")
+        plt.plot(times, one_survival, 'o-', label=f"q{q} T1 data")
         plt.plot(times, exponential_decay_curve(np.array(times), *fit_params),
-                 label=f"QC{q} fit: T1={fit_params[1]:.2f}us")
+                 label=f"q{q} fit: T1={fit_params[1]:.2f}us")
 
     plt.xlabel("Time [us]")
     plt.ylabel(r"Pr($|1\rangle$)")
@@ -149,9 +150,9 @@ def generate_t2_star_experiment(qubit: int, times: Sequence[float], detuning: fl
     for t in times:
         # TODO: avoid aliasing while being mindful of the 20ns resolution in the QCS stack
         t = round(t, 7)  # enforce 100ns boundaries
-        sequence = ([Program(RX(np.pi / 2, qubit)),  # prep
+        sequence = ([Program(RX(pi / 2, qubit)),  # prep
                      Program(Pragma('DELAY', [qubit], str(t))) # delay and measure
-                     + RZ(2 * np.pi * t * detuning, qubit) + RX(np.pi / 2, qubit)])
+                     + RZ(2 * pi * t * detuning, qubit) + RX(pi / 2, qubit)])
         settings = (ExperimentSetting(zeros_state([qubit]), PauliTerm('Z', qubit)),)
         t_in_us = round(t / MICROSECOND, 1)
 
@@ -179,10 +180,10 @@ def generate_t2_echo_experiment(qubit: int, times: Sequence[float], detuning: fl
         t = round(t, 7)  # enforce 100ns boundaries
 
         half_delay = Pragma('DELAY', [qubit], str(t/2))
-        echo_prog = Program([half_delay, RX(np.pi / 2, qubit), RX(np.pi / 2, qubit), half_delay])
-        sequence = ([Program(RX(np.pi / 2, qubit)), # prep
+        echo_prog = Program([half_delay, RX(pi / 2, qubit), RX(pi / 2, qubit), half_delay])
+        sequence = ([Program(RX(pi / 2, qubit)), # prep
                      # delay/echo/delay and measure
-                     echo_prog + RZ(2 * np.pi * t * detuning, qubit) + RX(np.pi / 2, qubit)])
+                     echo_prog + RZ(2 * pi * t * detuning, qubit) + RX(pi / 2, qubit)])
 
         settings = (ExperimentSetting(zeros_state([qubit]), PauliTerm('Z', qubit)),)
         t_in_us = round(t / MICROSECOND, 1)
@@ -259,9 +260,9 @@ def plot_t2_estimate_over_data(experiments: Union[StratifiedExperiment,
         times = [layer.depth * USEC_PER_DEPTH for layer in expt.layers]  # times in u-seconds
         one_survival = [layer.estimates["Fraction One"][0] for layer in expt.layers]
 
-        plt.plot(times, one_survival, 'o-', label=f"QC{q} T2 data")
+        plt.plot(times, one_survival, 'o-', label=f"q{q} T2 data")
         plt.plot(times, exponentially_decaying_sinusoidal_curve(np.array(times), *fit_params),
-                 label=f"QC{q} fit: freq={fit_params[2] / MHZ:.2f}MHz, "
+                 label=f"q{q} fit: freq={fit_params[2] / MHZ:.2f}MHz, "
                        f""f"T2={fit_params[1] / MICROSECOND:.2f}us")
 
     plt.xlabel("Time [us]")
@@ -346,10 +347,9 @@ def estimate_rabi(experiment: StratifiedExperiment):
     y_data = [layer.estimates["Fraction One"][0] for layer in experiment.layers]
 
     # fit to sinusoid
-    fit_params, fit_params_errs = fit_to_sinusoidal_waveform(np.array(x_data), np.array(y_data))
+    fit_params, fit_params_errs = fit_to_shifted_cosine(np.array(x_data), np.array(y_data))
     #TODO: check if estimates exists?
-    param_labels = ["Amplitude", "Baseline", "Frequency", "X Offset"]
-
+    param_labels = ["p(1|1)", "p(1|0)", "f_ideal/f_control", "Phase"]
     experiment.estimates = {label: (param, err) for label, param, err in zip(param_labels,
                                                                            fit_params,
                                                                            fit_params_errs)}
@@ -359,9 +359,9 @@ def estimate_rabi(experiment: StratifiedExperiment):
 
 def plot_rabi_estimate_over_data(experiments: Union[StratifiedExperiment,
                                                   Sequence[StratifiedExperiment]],
-                               expts_fit_params,
-                               expts_fit_params_errs, # TODO: plot err bars, make like rb
-                               filename: str = None) -> None:
+                                 expts_fit_params,
+                                 expts_fit_params_errs, # TODO: plot err bars, make like rb
+                                 filename: str = None) -> None:
     """
     Plot Rabi oscillation experimental data and estimated curve.
 
@@ -383,7 +383,7 @@ def plot_rabi_estimate_over_data(experiments: Union[StratifiedExperiment,
         one_survival = [layer.estimates["Fraction One"][0] for layer in expt.layers]
 
         plt.plot(angles, one_survival, 'o-', label=f"qubit {q} Rabi data")
-        plt.plot(angles, sinusoidal_waveform(np.array(angles), *fit_params),
+        plt.plot(angles, shifted_cosine(np.array(angles), *fit_params),
                  label=f"qubit {q} fitted line")
 
     plt.xlabel("RX angle [rad]")
@@ -413,7 +413,7 @@ def generate_cz_phase_ramsey_experiment(cz_qubits: Sequence[int], measure_qubit:
     qubits = tuple(set(cz_qubits).union([measure_qubit]))
     layers = []
     for angle in angles:
-        send_to_equator = Program(RX(np.pi/2, measure_qubit))
+        send_to_equator = Program(RX(pi/2, measure_qubit))
         apply_phase = Program(RZ(angle, measure_qubit))
         sequence = ([send_to_equator + CZ(*cz_qubits) + apply_phase + send_to_equator.dagger()])
         settings = (ExperimentSetting(zeros_state([measure_qubit]), PauliTerm('Z', measure_qubit)),)
@@ -456,18 +456,15 @@ def estimate_cz_phase_ramsey(experiment: StratifiedExperiment):
     x_data = [layer.continuous_param for layer in experiment.layers] # angles
     y_data = [layer.estimates["Fraction One"][0] for layer in experiment.layers]
 
-    # fit to sinusoid
-    fit_params, fit_params_errs = fit_to_sinusoidal_waveform(np.array(x_data), np.array(y_data))
+    # fit to (1-cos(angle))/2
+    fit_params, fit_params_errs = fit_to_shifted_cosine(np.array(x_data), np.array(y_data))
 
     #TODO: check if estimates exists?
-    param_labels = ["Amplitude", "Baseline", "Frequency", "X Offset"]
-
+    # TODO: check that these parameters are correct after re-factoring model
+    param_labels = ["p(1|1)", "p(1|0)", "f_ideal/f_control", "Phase"]
     experiment.estimates = {label: (param, err) for label, param, err in zip(param_labels,
                                                                            fit_params,
                                                                            fit_params_errs)}
-
-    # find max excited state visibility (ESV) and propagate error from fit params
-    experiment.estimates["Effective Applied Phase"] = get_peak_from_fit_params(fit_params, fit_params_errs)
 
     return fit_params, fit_params_errs
 
@@ -492,12 +489,13 @@ def plot_cz_ramsey_estimate_over_data(experiment: StratifiedExperiment, fit_para
     one_survival = [layer.estimates["Fraction One"][0] for layer in experiment.layers]
 
     plt.plot(angles, one_survival, 'o-', label=f"qubit{q} CZ Ramsey data")
-    plt.plot(angles, sinusoidal_waveform(np.array(angles), *fit_params),
+    plt.plot(angles, shifted_cosine(np.array(angles), *fit_params),
              label=f"qubit {q} fitted line")
 
-    estimated_phase, phase_err = experiment.estimates["Effective Applied Phase"]
-    plt.axvline(estimated_phase,
-                label=f"QC{q} max ESV={estimated_phase:.3f}+/-{phase_err:.3f} rad")
+    estimated_phase, phase_err = experiment.estimates["Phase"]
+    # TODO: is it important to plot the line at the peak?
+    plt.axvline(pi - estimated_phase,
+                label=f"pi - q{q} imparted phase={pi - estimated_phase:.3f}+/-{phase_err:.3f} rad")
 
     # TODO: support plotting of multiple experiments
     # if len(edges) == 1:
@@ -566,25 +564,39 @@ def fit_to_exponential_decay_curve(x_data: np.ndarray,
     return params, params_errs
 
 
-def sinusoidal_waveform(x: float,
-                        amplitude: float,
-                        baseline: float,
-                        frequency: float,
-                        x_offset: float) -> np.ufunc:
+def shifted_cosine(control_angle: float, p1_given_1: float, p1_given_0: float,
+                   f_ideal_over_f_control: float, f_ideal_phase: float) -> np.ufunc:
     """
     Calculate sinusoidal response at a series of points.
 
-    :param x: The independent variable with respect to which the sinusoidal response is calculated.
-    :param amplitude: The amplitude of the sinusoid.
-    :param baseline: The baseline of the sinusoid.
-    :param frequency: The frequency of the sinusoid.
-    :param x_offset: The x offset of the sinusoid.
+    :param control_angle: The independent variable; this is the angle that we specify in our
+        gates. If our gates are incorrectly calibrated then a given control angle will result in
+        a different angle with respect to the ideal qubit frequency by the factor
+        f_ideal_over_f_control.
+    :param p1_given_1: The probability of measuring 1 when the qubit is in the |1> state.
+    :param p1_given_0: The probability of measuring 1 when the qubit is in the |0> state.
+    :param f_ideal_over_f_control: The ratio of the true qubit frequency over the control
+        frequency determined by calibration. e.g. If our gates are incorrectly calibrated to
+        apply an over-rotation then f_ideal_over_f_control will be greater than 1; the control
+        frequency will be smaller than the true frequency so we interpret a given desired angle to
+        require more time, and that control time (multiplied by the larger true frequency) results
+        in a larger angle than the intended control angle.
+    :param f_ideal_phase: The offset phase, in radians, with respect to the ideal qubit frequency.
+        e.g. in a cz Ramsey experiment say that our RZ gate is perfectly calibrated and the cz
+        gate imparts an effective RZ(pi/5) rotation to the qubit; in this case f_ideal_phase is
+        pi/5 and this phase could be corrected by applying the gate RZ(-pi/5) after cz. If our RZ
+        gate was instead found to be mis-calibrated, note that the reported f_ideal_phase would
+        remain the same but a correction using our mis-calibrated gates would require a control
+        angle of RZ(-f_ideal_phase / f_ideal_over_f_control)
     :return: The sinusoidal response at the given phases(s).
     """
-    return amplitude * np.sin(frequency * x + x_offset) + baseline
+    amplitude = (p1_given_1 - p1_given_0) / 2
+    baseline = amplitude + p1_given_0
+    return -1 * amplitude * np.cos(f_ideal_over_f_control * control_angle + f_ideal_phase) + \
+           baseline
 
 
-def fit_to_sinusoidal_waveform(x_data: np.ndarray,
+def fit_to_shifted_cosine(x_data: np.ndarray,
                                y_data: List[float],
                                displayflag: bool = False) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -595,8 +607,8 @@ def fit_to_sinusoidal_waveform(x_data: np.ndarray,
     :param displayflag: If True displays results from scipy curve fit analysis.
     :return: Arrays of fitted decay curve parameters and their standard deviations
     """
-    params, params_covariance = optimize.curve_fit(sinusoidal_waveform, x_data, y_data,
-                                                   p0=[0.5, 0.5, 1.0, np.pi / 2])
+    params, params_covariance = optimize.curve_fit(shifted_cosine, x_data, y_data,
+                                                   p0=[0.5, 0.5, 1.0, 0.])
     # parameter error extraction from
     # https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.curve_fit.html
     params_errs = np.sqrt(np.diag(params_covariance))
@@ -609,41 +621,12 @@ def fit_to_sinusoidal_waveform(x_data: np.ndarray,
 
     if displayflag:
         print("scipy curve fitting analysis returned\n"
-              "amplitude:\t{:.5f} +/- {:.5f}\n"
-              "baseline:\t{:.5f} +/- {:.5f}\n"
-              "frequency:\t{:.5f} +/- {:.5f}\n"
-              "x offset:\t{:.5f} +/- {:.5f}".format(*print_params))
+              "p(1|1):\t{:.5f} +/- {:.5f}\n"
+              "p(1|0):\t{:.5f} +/- {:.5f}\n"
+              "f_ideal/f_control:\t{:.5f} +/- {:.5f}\n"
+              "Phase:\t{:.5f} +/- {:.5f}".format(*print_params))
 
     return params, params_errs
-
-
-def get_peak_from_fit_params(fit_params: np.ndarray,
-                             fit_params_errs: np.ndarray) -> Tuple[float, float]:
-    """
-    Extract peak from the fit parameters returned by scipy.optimize.curve_fit.
-
-    :param fit_params: fit parameters out of scipy.optimize.curve_fit
-    :param fit_params_errs: standard deviations on the fit parameters from scipy.optimize.curve_fit
-    :return: The phase corresponding the to the maximum excited state visibility and its st. dev.
-    """
-    # TODO: do away with hard-coded indices for fit params
-    x0 = fit_params[-1]
-    x0_err = fit_params_errs[-1]
-    freq = fit_params[-2]
-    freq_err = fit_params_errs[-2]
-
-    print("propagating error using x_0 = {} +/- {} and freq = {} +/- {}".format(x0, x0_err,
-                                                                                freq, freq_err))
-
-    # find the phase corresponding to maximum excited state visibility (ESV) using the fit params
-    max_ESV = (np.pi / 2 - x0) / freq
-    # max_ESV_err obtained by applying error propagation formula to max_ESV
-    max_ESV_err = np.sqrt((x0_err / freq) ** 2 + ((np.pi / 2 - x0) * (freq_err / freq ** 2)) ** 2)
-
-    print("\nmaximum excited state visibility observed at x = {} +/- {}".format(max_ESV,
-                                                                                max_ESV_err))
-
-    return max_ESV, max_ESV_err
 
 
 def exponentially_decaying_sinusoidal_curve(t: Union[float, np.ndarray],
